@@ -1,6 +1,73 @@
 #include <windows.h> //Includes declarations for all the functions in the windows API
 #include <tlhelp32.h> // provides declarations for the Tool Help Library
 #include <stdio.h> // standard input and output
+#include <winternl.h> // For UNICODE_STRING and OBJECT_INFORMATION_CLASS
+
+
+// Structures and function pointers for NtQuerySystemInformation and NtQueryObject
+typedef struct _SYSTEM_HANDLE {
+    ULONG ProcessId;
+    UCHAR ObjectTypeNumber;
+    UCHAR Flags;
+    USHORT Handle;
+    PVOID Object;
+    ACCESS_MASK GrantedAccess;
+} SYSTEM_HANDLE, *PSYSTEM_HANDLE;
+
+typedef struct _SYSTEM_HANDLE_INFORMATION {
+    ULONG HandleCount;
+    SYSTEM_HANDLE Handles[1];
+} SYSTEM_HANDLE_INFORMATION, *PSYSTEM_HANDLE_INFORMATION;
+
+// UNICODE_STRING is already defined in <winternl.h>
+
+typedef struct _OBJECT_TYPE_INFORMATION {
+    UNICODE_STRING TypeName;
+    ULONG TotalNumberOfObjects;
+    ULONG TotalNumberOfHandles;
+    ULONG TotalPagedPoolUsage;
+    ULONG TotalNonPagedPoolUsage;
+    ULONG TotalNamePoolUsage;
+    ULONG TotalHandleTableUsage;
+    ULONG HighWaterNumberOfObjects;
+    ULONG HighWaterNumberOfHandles;
+    ULONG QuotaPoolUsage;
+    ULONG Reserved[8];
+} OBJECT_TYPE_INFORMATION, *POBJECT_TYPE_INFORMATION;
+
+typedef enum _SYSTEM_INFORMATION_CLASS {
+    SystemHandleInformation = 16, // Corresponds to SYSTEM_HANDLE_INFORMATION
+} SYSTEM_INFORMATION_CLASS;
+
+// OBJECT_INFORMATION_CLASS is already defined in <winternl.h>
+
+typedef NTSTATUS (NTAPI *_NtQuerySystemInformation)(
+    SYSTEM_INFORMATION_CLASS SystemInformationClass,
+    PVOID SystemInformation,
+    ULONG SystemInformationLength,
+    PULONG ReturnLength
+);
+
+typedef NTSTATUS (NTAPI *_NtQueryObject)(
+    HANDLE Handle,
+    OBJECT_INFORMATION_CLASS ObjectInformationClass,
+    PVOID ObjectInformation,
+    ULONG ObjectInformationLength,
+    PULONG ReturnLength
+);
+
+// Handle the case if these are not defined in older SDKs
+#ifndef NTSTATUS
+#define NTSTATUS LONG
+#endif
+
+#ifndef STATUS_SUCCESS
+#define STATUS_SUCCESS ((NTSTATUS)0x00000000L)
+#endif
+
+#ifndef STATUS_INFO_LENGTH_MISMATCH
+#define STATUS_INFO_LENGTH_MISMATCH ((NTSTATUS)0xC0000004L)
+#endif
 
 void procEnum() {
     HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -24,14 +91,10 @@ void procEnum() {
     do {
         printf("%lu\t%lu\t\t%s\n", pe32.th32ProcessID, pe32.th32ParentProcessID, pe32.szExeFile);
         ThreadEnum(pe32.th32ProcessID); // Call ThreadEnum for each process
+        handleenum(pe32.th32ProcessID); // Call handleenum for each process
     } while (Process32Next(hSnapshot, &pe32));
 
     CloseHandle(hSnapshot);
-}
-
-int main() {
-    procEnum();
-    return 0;
 }
 
 void ThreadEnum(DWORD dwOwnerPID){
@@ -62,5 +125,132 @@ void ThreadEnum(DWORD dwOwnerPID){
 
     CloseHandle(hThreadSnap);
 }
+
+void handleenum(DWORD dwOwnerPID) {
+    HMODULE hNtdll = LoadLibraryA("ntdll.dll");
+    if (!hNtdll) {
+        printf("Error: Could not load ntdll.dll\n");
+        return;
+    }
+
+    _NtQuerySystemInformation NtQuerySystemInformation = (_NtQuerySystemInformation)GetProcAddress(hNtdll, "NtQuerySystemInformation");
+    _NtQueryObject NtQueryObject = (_NtQueryObject)GetProcAddress(hNtdll, "NtQueryObject");
+
+    if (!NtQuerySystemInformation || !NtQueryObject) {
+        printf("Error: Could not get address of NtQuerySystemInformation or NtQueryObject\n");
+        FreeLibrary(hNtdll);
+        return;
+    }
+
+    PSYSTEM_HANDLE_INFORMATION pHandleInfo = NULL;
+    ULONG bufferSize = 0x10000; // Initial buffer size
+    NTSTATUS status;
+
+    do {
+        pHandleInfo = (PSYSTEM_HANDLE_INFORMATION)realloc(pHandleInfo, bufferSize);
+        if (!pHandleInfo) {
+            printf("Error: Failed to allocate memory for handle information.\n");
+            FreeLibrary(hNtdll);
+            return;
+        }
+
+        status = NtQuerySystemInformation(SystemHandleInformation, pHandleInfo, bufferSize, &bufferSize);
+
+        if (status == STATUS_INFO_LENGTH_MISMATCH) {
+            bufferSize += 0x10000; // Increase buffer size and try again
+        } else if (!NT_SUCCESS(status)) {
+            printf("Error: NtQuerySystemInformation failed with status 0x%X\n", status);
+            free(pHandleInfo);
+            FreeLibrary(hNtdll);
+            return;
+        }
+
+    } while (status == STATUS_INFO_LENGTH_MISMATCH);
+
+    printf("\nHangles for Process ID: %lu\n", dwOwnerPID);
+    printf("--------------------------------------------------\n");
+
+    for (ULONG i = 0; i < pHandleInfo->HandleCount; i++) {
+        SYSTEM_HANDLE sysHandle = pHandleInfo->Handles[i];
+
+        // Filter handles by PID
+        if (sysHandle.ProcessId != dwOwnerPID) {
+            continue;
+        }
+        
+        // Skip invalid handles or handles from the current process
+        // GetCurrentProcessId() identifies the PID of the WinSysInspector itself
+        if (sysHandle.Handle == 0 || sysHandle.ProcessId == GetCurrentProcessId()) {
+            continue;
+        }
+
+        HANDLE hDuplicatedHandle = NULL;
+        // Duplicate the handle
+        // DUPLICATE_SAME_ACCESS ensures the duplicated handle has the same access rights
+        // as the source handle, but we could also request specific access rights.
+        if (!DuplicateHandle(
+            OpenProcess(PROCESS_DUP_HANDLE, FALSE, sysHandle.ProcessId), // Source process handle
+            (HANDLE)sysHandle.Handle,                                   // Source handle
+            GetCurrentProcess(),                                        // Target process handle
+            &hDuplicatedHandle,                                         // Duplicated handle
+            0,                                                          // Desired access (ignored with DUPLICATE_SAME_ACCESS)
+            FALSE,                                                      // Inherit handle
+            DUPLICATE_SAME_ACCESS))                                     // Options
+        {
+            // If duplication fails, it might be due to insufficient access rights
+            // or the handle being invalid. Continue to the next handle.
+            continue;
+        }
+
+        // Query its type
+        POBJECT_TYPE_INFORMATION pObjectTypeInfo = NULL;
+        ULONG typeInfoSize = 0x1000; // Initial buffer size
+        
+        do {
+            pObjectTypeInfo = (POBJECT_TYPE_INFORMATION)realloc(pObjectTypeInfo, typeInfoSize);
+            if (!pObjectTypeInfo) {
+                printf("Error: Failed to allocate memory for object type information.\n");
+                break; // Break from inner loop, try next handle
+            }
+
+            status = NtQueryObject(
+                hDuplicatedHandle,
+                ObjectTypeInformation,
+                pObjectTypeInfo,
+                typeInfoSize,
+                &typeInfoSize
+            );
+
+            if (status == STATUS_INFO_LENGTH_MISMATCH) {
+                // Buffer too small, reallocate and try again
+                typeInfoSize += 0x1000;
+            } else if (NT_SUCCESS(status)) {
+                // Successfully got type information
+                // Print handle value and type name
+                wprintf(L"  Handle: 0x%X, Type: %.*s\n", sysHandle.Handle, 
+                        pObjectTypeInfo->TypeName.Length / sizeof(WCHAR), 
+                        pObjectTypeInfo->TypeName.Buffer);
+            } else {
+                // NtQueryObject failed for other reasons
+                // printf("Error: NtQueryObject failed for handle 0x%X with status 0x%X\n", sysHandle.Handle, status);
+            }
+
+        } while (status == STATUS_INFO_LENGTH_MISMATCH);
+
+        if (pObjectTypeInfo) {
+            free(pObjectTypeInfo);
+            pObjectTypeInfo = NULL;
+        }
+        if (hDuplicatedHandle) {
+            CloseHandle(hDuplicatedHandle);
+        }
+    }
+
+    if (pHandleInfo) {
+        free(pHandleInfo);
+    }
+    FreeLibrary(hNtdll);
+}
+
 
 
