@@ -1,6 +1,6 @@
-#include <windows.h> //Includes declarations for all the functions in the windows API
-#include <tlhelp32.h> // provides declarations for the Tool Help Library
-#include <stdio.h> // standard input and output
+#include <windows.h> 
+#include <tlhelp32.h> 
+#include <stdio.h> 
 #include <winternl.h> // For UNICODE_STRING and OBJECT_INFORMATION_CLASS
 
 
@@ -92,6 +92,7 @@ void procEnum() {
         printf("%lu\t%lu\t\t%s\n", pe32.th32ProcessID, pe32.th32ParentProcessID, pe32.szExeFile);
         ThreadEnum(pe32.th32ProcessID); // Call ThreadEnum for each process
         handleenum(pe32.th32ProcessID); // Call handleenum for each process
+        memoryMapEnum(pe32.th32ProcessID); // Call memoryMapEnum for each process
     } while (Process32Next(hSnapshot, &pe32));
 
     CloseHandle(hSnapshot);
@@ -126,7 +127,7 @@ void ThreadEnum(DWORD dwOwnerPID){
     CloseHandle(hThreadSnap);
 }
 
-void handleenum(DWORD dwOwnerPID) {
+void handleEnum(DWORD dwOwnerPID) {
     HMODULE hNtdll = LoadLibraryA("ntdll.dll");
     if (!hNtdll) {
         printf("Error: Could not load ntdll.dll\n");
@@ -167,7 +168,7 @@ void handleenum(DWORD dwOwnerPID) {
 
     } while (status == STATUS_INFO_LENGTH_MISMATCH);
 
-    printf("\nHangles for Process ID: %lu\n", dwOwnerPID);
+    printf("\nHandles for Process ID: %lu\n", dwOwnerPID);
     printf("--------------------------------------------------\n");
 
     for (ULONG i = 0; i < pHandleInfo->HandleCount; i++) {
@@ -250,6 +251,52 @@ void handleenum(DWORD dwOwnerPID) {
         free(pHandleInfo);
     }
     FreeLibrary(hNtdll);
+}
+
+void memoryMapEnum(DWORD dwOwnerPID) {
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | VIRTUAL_MEM_READ, FALSE, dwOwnerPID);
+    if (hProcess == NULL) {
+        // printf("Error: Could not open process for PID %lu. Error: %lu\n", dwOwnerPID, GetLastError());
+        return;
+    }
+
+    printf("\nMemory Map for Process ID: %lu\n", dwOwnerPID);
+    printf("--------------------------------------------------\n");
+    printf("Base Address\tSize\t\tProtection\n");
+    printf("--------------------------------------------------\n");
+
+    MEMORY_BASIC_INFORMATION mbi;
+    LPCVOID lpAddress = 0;
+
+    while (VirtualQueryEx(hProcess, lpAddress, &mbi, sizeof(mbi)) == sizeof(mbi)) {
+        printf("%p\t%lu\t\t", mbi.BaseAddress, mbi.RegionSize);
+
+        // Interpret protection flags
+        if (mbi.Protect == 0) { // No protection
+            printf("---");
+        } else {
+            if (mbi.Protect & PAGE_READONLY) printf("R");
+            if (mbi.Protect & PAGE_READWRITE) printf("RW");
+            if (mbi.Protect & PAGE_EXECUTE) printf("X"); // Use X for execute
+            if (mbi.Protect & PAGE_EXECUTE_READ) printf("RX");
+            if (mbi.Protect & PAGE_EXECUTE_READWRITE) printf("RWX");
+            // Add more common flags if needed, e.g., PAGE_NOACCESS, PAGE_GUARD
+            // For simplicity, I'll focus on the primary access types.
+        }
+        
+        printf("\n");
+
+        // Move to the next region
+        // This is crucial to avoid an infinite loop
+        if (mbi.RegionSize == 0) { // Avoid infinite loop if RegionSize is somehow 0
+            lpAddress = (LPCVOID)((char*)lpAddress + 4096); // Advance by a page size
+        } else {
+            lpAddress = (LPCVOID)((char*)mbi.BaseAddress + mbi.RegionSize);
+        }
+        if (lpAddress == NULL) break; // Reached end of address space (or overflowed)
+    }
+
+    CloseHandle(hProcess);
 }
 
 
