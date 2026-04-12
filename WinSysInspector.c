@@ -1,10 +1,10 @@
 #include <windows.h> 
 #include <tlhelp32.h> 
 #include <stdio.h> 
-#include <winternl.h> // For UNICODE_STRING and OBJECT_INFORMATION_CLASS
+#include <winternl.h> 
+#include <wchar.h> 
 
-
-// Structures and function pointers for NtQuerySystemInformation and NtQueryObject
+//NtQuerySystemInformation and NtQueryObject structures and function pointers
 typedef struct _SYSTEM_HANDLE {
     ULONG ProcessId;
     UCHAR ObjectTypeNumber;
@@ -18,8 +18,6 @@ typedef struct _SYSTEM_HANDLE_INFORMATION {
     ULONG HandleCount;
     SYSTEM_HANDLE Handles[1];
 } SYSTEM_HANDLE_INFORMATION, *PSYSTEM_HANDLE_INFORMATION;
-
-// UNICODE_STRING is already defined in <winternl.h>
 
 typedef struct _OBJECT_TYPE_INFORMATION {
     UNICODE_STRING TypeName;
@@ -36,10 +34,8 @@ typedef struct _OBJECT_TYPE_INFORMATION {
 } OBJECT_TYPE_INFORMATION, *POBJECT_TYPE_INFORMATION;
 
 typedef enum _SYSTEM_INFORMATION_CLASS {
-    SystemHandleInformation = 16, // Corresponds to SYSTEM_HANDLE_INFORMATION
+    SystemHandleInformation = 16, 
 } SYSTEM_INFORMATION_CLASS;
-
-// OBJECT_INFORMATION_CLASS is already defined in <winternl.h>
 
 typedef NTSTATUS (NTAPI *_NtQuerySystemInformation)(
     SYSTEM_INFORMATION_CLASS SystemInformationClass,
@@ -56,7 +52,6 @@ typedef NTSTATUS (NTAPI *_NtQueryObject)(
     PULONG ReturnLength
 );
 
-// Handle the case if these are not defined in older SDKs
 #ifndef NTSTATUS
 #define NTSTATUS LONG
 #endif
@@ -90,9 +85,9 @@ void procEnum() {
 
     do {
         printf("%lu\t%lu\t\t%s\n", pe32.th32ProcessID, pe32.th32ParentProcessID, pe32.szExeFile);
-        ThreadEnum(pe32.th32ProcessID); // Call ThreadEnum for each process
-        handleenum(pe32.th32ProcessID); // Call handleenum for each process
-        memoryMapEnum(pe32.th32ProcessID); // Call memoryMapEnum for each process
+        ThreadEnum(pe32.th32ProcessID); 
+        handleenum(pe32.th32ProcessID); 
+        memoryMapEnum(pe32.th32ProcessID); 
     } while (Process32Next(hSnapshot, &pe32));
 
     CloseHandle(hSnapshot);
@@ -119,8 +114,7 @@ void ThreadEnum(DWORD dwOwnerPID){
 
     do {
         if (te32.th32OwnerProcessID == dwOwnerPID) {
-            printf("  Thread ID: %lu\n", te32.th32ThreadID);
-            // TODO: Use GetThreadContext to inspect registers (safe)
+            printf("  Thread ID: %lu\n", te32.th32ThreadID);            
         }
     } while (Thread32Next(hThreadSnap, &te32));
 
@@ -144,7 +138,7 @@ void handleEnum(DWORD dwOwnerPID) {
     }
 
     PSYSTEM_HANDLE_INFORMATION pHandleInfo = NULL;
-    ULONG bufferSize = 0x10000; // Initial buffer size
+    ULONG bufferSize = 0x10000; 
     NTSTATUS status;
 
     do {
@@ -158,7 +152,7 @@ void handleEnum(DWORD dwOwnerPID) {
         status = NtQuerySystemInformation(SystemHandleInformation, pHandleInfo, bufferSize, &bufferSize);
 
         if (status == STATUS_INFO_LENGTH_MISMATCH) {
-            bufferSize += 0x10000; // Increase buffer size and try again
+            bufferSize += 0x10000; 
         } else if (!NT_SUCCESS(status)) {
             printf("Error: NtQuerySystemInformation failed with status 0x%X\n", status);
             free(pHandleInfo);
@@ -174,44 +168,35 @@ void handleEnum(DWORD dwOwnerPID) {
     for (ULONG i = 0; i < pHandleInfo->HandleCount; i++) {
         SYSTEM_HANDLE sysHandle = pHandleInfo->Handles[i];
 
-        // Filter handles by PID
         if (sysHandle.ProcessId != dwOwnerPID) {
             continue;
         }
         
-        // Skip invalid handles or handles from the current process
-        // GetCurrentProcessId() identifies the PID of the WinSysInspector itself
         if (sysHandle.Handle == 0 || sysHandle.ProcessId == GetCurrentProcessId()) {
             continue;
         }
 
         HANDLE hDuplicatedHandle = NULL;
-        // Duplicate the handle
-        // DUPLICATE_SAME_ACCESS ensures the duplicated handle has the same access rights
-        // as the source handle, but we could also request specific access rights.
         if (!DuplicateHandle(
-            OpenProcess(PROCESS_DUP_HANDLE, FALSE, sysHandle.ProcessId), // Source process handle
-            (HANDLE)sysHandle.Handle,                                   // Source handle
-            GetCurrentProcess(),                                        // Target process handle
-            &hDuplicatedHandle,                                         // Duplicated handle
-            0,                                                          // Desired access (ignored with DUPLICATE_SAME_ACCESS)
-            FALSE,                                                      // Inherit handle
-            DUPLICATE_SAME_ACCESS))                                     // Options
+            OpenProcess(PROCESS_DUP_HANDLE, FALSE, sysHandle.ProcessId), 
+            (HANDLE)sysHandle.Handle,                                   
+            GetCurrentProcess(),                                        
+            &hDuplicatedHandle,                                        
+            0,                                                          
+            FALSE,                                                      
+            DUPLICATE_SAME_ACCESS))                               
         {
-            // If duplication fails, it might be due to insufficient access rights
-            // or the handle being invalid. Continue to the next handle.
             continue;
         }
 
-        // Query its type
         POBJECT_TYPE_INFORMATION pObjectTypeInfo = NULL;
-        ULONG typeInfoSize = 0x1000; // Initial buffer size
+        ULONG typeInfoSize = 0x1000; 
         
         do {
             pObjectTypeInfo = (POBJECT_TYPE_INFORMATION)realloc(pObjectTypeInfo, typeInfoSize);
             if (!pObjectTypeInfo) {
                 printf("Error: Failed to allocate memory for object type information.\n");
-                break; // Break from inner loop, try next handle
+                break; 
             }
 
             status = NtQueryObject(
@@ -223,17 +208,13 @@ void handleEnum(DWORD dwOwnerPID) {
             );
 
             if (status == STATUS_INFO_LENGTH_MISMATCH) {
-                // Buffer too small, reallocate and try again
                 typeInfoSize += 0x1000;
             } else if (NT_SUCCESS(status)) {
-                // Successfully got type information
-                // Print handle value and type name
                 wprintf(L"  Handle: 0x%X, Type: %.*s\n", sysHandle.Handle, 
                         pObjectTypeInfo->TypeName.Length / sizeof(WCHAR), 
                         pObjectTypeInfo->TypeName.Buffer);
             } else {
-                // NtQueryObject failed for other reasons
-                // printf("Error: NtQueryObject failed for handle 0x%X with status 0x%X\n", sysHandle.Handle, status);
+             
             }
 
         } while (status == STATUS_INFO_LENGTH_MISMATCH);
@@ -256,7 +237,7 @@ void handleEnum(DWORD dwOwnerPID) {
 void memoryMapEnum(DWORD dwOwnerPID) {
     HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | VIRTUAL_MEM_READ, FALSE, dwOwnerPID);
     if (hProcess == NULL) {
-        // printf("Error: Could not open process for PID %lu. Error: %lu\n", dwOwnerPID, GetLastError());
+        printf("Error: Could not open process for PID %lu. Error: %lu\n", dwOwnerPID, GetLastError());
         return;
     }
 
@@ -271,29 +252,26 @@ void memoryMapEnum(DWORD dwOwnerPID) {
     while (VirtualQueryEx(hProcess, lpAddress, &mbi, sizeof(mbi)) == sizeof(mbi)) {
         printf("%p\t%lu\t\t", mbi.BaseAddress, mbi.RegionSize);
 
-        // Interpret protection flags
-        if (mbi.Protect == 0) { // No protection
+       
+        if (mbi.Protect == 0) { 
             printf("---");
         } else {
             if (mbi.Protect & PAGE_READONLY) printf("R");
             if (mbi.Protect & PAGE_READWRITE) printf("RW");
-            if (mbi.Protect & PAGE_EXECUTE) printf("X"); // Use X for execute
+            if (mbi.Protect & PAGE_EXECUTE) printf("X"); 
             if (mbi.Protect & PAGE_EXECUTE_READ) printf("RX");
             if (mbi.Protect & PAGE_EXECUTE_READWRITE) printf("RWX");
-            // Add more common flags if needed, e.g., PAGE_NOACCESS, PAGE_GUARD
-            // For simplicity, I'll focus on the primary access types.
+          
         }
         
         printf("\n");
 
-        // Move to the next region
-        // This is crucial to avoid an infinite loop
-        if (mbi.RegionSize == 0) { // Avoid infinite loop if RegionSize is somehow 0
-            lpAddress = (LPCVOID)((char*)lpAddress + 4096); // Advance by a page size
+        if (mbi.RegionSize == 0) { 
+            lpAddress = (LPCVOID)((char*)lpAddress + 4096); ze
         } else {
             lpAddress = (LPCVOID)((char*)mbi.BaseAddress + mbi.RegionSize);
         }
-        if (lpAddress == NULL) break; // Reached end of address space (or overflowed)
+        if (lpAddress == NULL) break; 
     }
 
     CloseHandle(hProcess);
